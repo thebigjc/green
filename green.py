@@ -53,86 +53,17 @@ def extract_usage_data(root):
 usage_data = extract_usage_data(root)
 df_usage = pd.DataFrame(usage_data)
 
-# Convert the start times to Eastern Time
-eastern = timezone("US/Eastern")
-df_usage["start_time"] = (
-    df_usage["start_time"].dt.tz_localize("UTC").dt.tz_convert(eastern)
-)
-
-# Extract hour of day and day of week for TOU rate determination
-df_usage["hour_of_day"] = df_usage["start_time"].dt.hour
-df_usage["day_of_week"] = df_usage["start_time"].dt.weekday
-df_usage["date"] = df_usage["start_time"].dt.date
-
-# Define the TOU rates in cents per kWh
-tou_rates = {
-    "on_peak": 28.6,
-    "mid_peak": 12.2,
-    "off_peak": 8.7,
-    "ulo": 2.8,  # Ultra-Low Overnight
-}
-
-# Define the TOU time periods for Weekday Winter (Nov 1 to Apr 30)
-tou_periods_winter = {
-    "on_peak": [(7, 11), (17, 19)],
-    "mid_peak": [(11, 17)],
-    "off_peak": [(19, 24), (0, 7)],
-    "ulo": [(0, 7)],  # Assuming this applies for overnight
-}
 
 # Apply the powerOfTenMultiplier to adjust the usage values
 df_usage["value_wh"] = df_usage["value"] * 10 ** int(
     reading_type_info["powerOfTenMultiplier"]
 )
-df_usage["value_kwh"] = df_usage["value_wh"] / 1000
+df_usage["adjusted_value_kWh"] = df_usage["value_wh"] / 1000
 
-
-# Function to determine the TOU period for a given hour and day
-def get_tou_period(hour, day_of_week, date):
-    # Check if the day is a weekend or a holiday
-    is_weekend_or_holiday = (
-        day_of_week >= 5
-    )  # 5 and 6 correspond to Saturday and Sunday
-    # For simplicity, we are not checking for statutory holidays here
-    # but this can be included by checking the date against a list of holidays
-
-    # During the weekend and holidays, all day is off-peak
-    if is_weekend_or_holiday:
-        return "off_peak"
-
-    # Apply winter weekday TOU periods
-    for period, hours in tou_periods_winter.items():
-        for hour_range in hours:
-            if hour_range[0] <= hour < hour_range[1]:
-                return period
-    return "off_peak"  # Default to off-peak if no match
-
-
-# Assign the TOU period based on the hour of the day and day of the week
-df_usage["tou_period"] = df_usage.apply(
-    lambda row: get_tou_period(row["hour_of_day"], row["day_of_week"], row["date"]),
-    axis=1,
-)
-
-# Map the TOU period to the rate in cents
-df_usage["rate_cents"] = df_usage["tou_period"].map(tou_rates)
-
-# Calculate the cost in dollars
-df_usage["cost"] = (
-    df_usage["value_kwh"] * df_usage["rate_cents"] / 100
-)  # Convert cents to dollars
-
-print(f"Total OLU Cost: ${df_usage['cost'].sum():.2f}")
-
-# Define the tiered rates in cents per kWh
-tiered_rates = {
-    "tier_1": 10.3,  # Rate for up to the threshold
-    "tier_2": 12.5,  # Rate for above the threshold
-}
-
-# Initialize the cost counters
-monthly_tier_usage = {}
-total_tiered_cost = 0.0
+df_usage["hour_of_day"] = df_usage["start_time"].dt.hour
+df_usage["day_of_week"] = df_usage["start_time"].dt.weekday
+df_usage["date"] = df_usage["start_time"].dt.date
+df_usage["is_weekend"] = df_usage["day_of_week"] >= 5
 
 
 # Function to get the correct threshold based on the month
@@ -142,36 +73,142 @@ def get_tier_threshold(month):
     )  # Summer threshold is 600 kWh, winter threshold is 1000 kWh
 
 
-# Sort the usage by start_time
-df_usage_sorted = df_usage.sort_values(by="start_time")
+def get_tou_period(month, hour, is_weekend):
+    if is_weekend:
+        return "off_peak"
 
-# Calculate the tiered costs
-for index, row in df_usage_sorted.iterrows():
-    month = row["start_time"].month
-    # Check if the month has changed or is not in the dictionary
-    if month not in monthly_tier_usage:
-        # Reset the tier usage for the new month
-        monthly_tier_usage[month] = 0
-
-    tier_threshold = get_tier_threshold(month)
-    if monthly_tier_usage[month] < tier_threshold:
-        # Calculate how much of the current usage can be billed at tier_1 rate
-        tier_1_usage = min(row["value_kwh"], tier_threshold - monthly_tier_usage[month])
-        # Calculate the cost for tier_1 usage and add it to the total cost
-        total_tiered_cost += tier_1_usage * tiered_rates["tier_1"]
-        # Update the tier usage for the month
-        monthly_tier_usage[month] += tier_1_usage
-        # Calculate if there's any usage that needs to be billed at tier_2 rate
-        tier_2_usage = row["value_kwh"] - tier_1_usage
+    if 5 <= month <= 10:
+        return get_tou_period_summer(hour)
     else:
-        # All usage is billed at tier_2 rate
-        tier_2_usage = row["value_kwh"]
+        return get_tou_period_winter(hour)
 
-    # Calculate the cost for tier_2 usage and add it to the total cost
-    total_tiered_cost += tier_2_usage * tiered_rates["tier_2"]
 
-# Convert the cost from cent
-total_tiered_cost /= 100
+def get_olu_period(hour, is_weekend):
+    if is_weekend:
+        return "off_peak"
 
-# Output the total cost for tiered pricing
-print(f"Total Tiered Cost: ${total_tiered_cost:.2f}")
+    if 7 <= hour < 16 or 21 <= hour < 23:
+        return "mid_peak"
+    elif 16 <= hour < 21:
+        return "on_peak"
+    else:
+        return "ulo"
+
+
+# Function to determine the TOU period for a given hour in winter
+def get_tou_period_winter(hour):
+    if 7 <= hour < 11 or 17 <= hour < 19:
+        return "mid_peak"
+    elif 11 <= hour < 17:
+        return "on_peak"
+    else:
+        return "off_peak"
+
+
+# Function to determine the TOU period for a given hour in summer
+def get_tou_period_summer(hour):
+    if 7 <= hour < 11 or 17 <= hour < 19:
+        return "on_peak"
+    elif 11 <= hour < 17:
+        return "mid_peak"
+    else:
+        return "off_peak"
+
+
+# Assuming df_usage is your DataFrame with the usage data
+# Ensure df_usage has 'start_time' as datetime objects and 'adjusted_value_kWh' as the energy consumption in kWh
+
+# Define the TOU and Tiered rates in cents per kWh
+tou_rates = {
+    "on_peak": 18.2,
+    "mid_peak": 12.2,
+    "off_peak": 8.7,
+}
+
+# Define the TOU and Tiered rates in cents per kWh
+ulo_rates = {
+    "on_peak": 28.6,
+    "mid_peak": 12.2,
+    "off_peak": 8.7,
+    "ulo": 2.8,  # Ultra-Low Overnight is not considered in this scenario
+}
+
+tiered_rates = {
+    "tier_1": 10.3,  # Rate for up to the threshold
+    "tier_2": 12.5,  # Rate for above the threshold
+}
+
+# Prepare dataframes for calculations
+df_usage["month"] = df_usage["start_time"].dt.month
+df_usage["tou_period"] = df_usage.apply(
+    lambda row: get_tou_period(row["month"], row["hour_of_day"], row["is_weekend"]),
+    axis=1,
+)
+df_usage["ulo_period"] = df_usage.apply(
+    lambda row: get_olu_period(row["hour_of_day"], row["is_weekend"]), axis=1
+)
+df_usage["tou_rate_cents"] = df_usage["tou_period"].map(tou_rates)
+df_usage["ulo_rate_cents"] = df_usage["ulo_period"].map(ulo_rates)
+
+# Initialize the results dictionary
+monthly_costs = {}
+
+
+def sum_cost(month, prefix):
+    # TOU Calculation
+    monthly_data[f"{prefix}_cost"] = (
+        monthly_data["adjusted_value_kWh"] * monthly_data[f"{prefix}_rate_cents"] / 100
+    )
+    return monthly_data[f"{prefix}_cost"].sum()
+
+
+# Calculate the costs for each month
+for month in df_usage["month"].unique():
+    monthly_data = df_usage[df_usage["month"] == month]
+
+    # Tiered Calculation
+    tier_threshold = get_tier_threshold(month)
+    tier_1_usage_total = min(monthly_data["adjusted_value_kWh"].sum(), tier_threshold)
+    tier_2_usage_total = max(
+        monthly_data["adjusted_value_kWh"].sum() - tier_threshold, 0
+    )
+    tiered_total_cost = (
+        tier_1_usage_total * tiered_rates["tier_1"]
+        + tier_2_usage_total * tiered_rates["tier_2"]
+    ) / 100
+
+    tou_total_cost = sum_cost(monthly_data, "tou")
+    olu_total_cost = sum_cost(monthly_data, "ulo")
+
+    min_cost = min(tou_total_cost, olu_total_cost, tiered_total_cost)
+    max_cost = max(tou_total_cost, olu_total_cost, tiered_total_cost)
+
+    if min_cost == tou_total_cost:
+        best = "TOU"
+    elif min_cost == olu_total_cost:
+        best = "OLU"
+    else:
+        best = "Tiered"
+
+    if max_cost == tou_total_cost:
+        worst = "TOU"
+    elif max_cost == olu_total_cost:
+        worst = "OLU"
+    else:
+        worst = "Tiered"
+
+    # Store results
+    monthly_costs[month] = {
+        "Total Usage": monthly_data["adjusted_value_kWh"].sum(),
+        "TOU Cost": tou_total_cost,
+        "OLU Cost": olu_total_cost,
+        "Tiered Cost": tiered_total_cost,
+        "Best": best,
+        "Worst": worst,
+    }
+
+# Convert the results to a DataFrame for better visualization
+df_monthly_costs = pd.DataFrame.from_dict(monthly_costs, orient="index")
+
+# Display the monthly costs and differences
+print(df_monthly_costs)
