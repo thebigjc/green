@@ -1,12 +1,17 @@
-# Re-import necessary libraries due to execution state reset
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import pandas as pd
 from pytz import timezone
 import re
+import matplotlib.pyplot as plt
+import numpy as np
+import holidays
+import sys
 
 # Re-load the XML file due to code execution state reset
-file_path = "./Hydro1_Electric_60_Minute_08-24-2023_12-14-2023.xml"
+file_path = sys.argv[1]
+
+# Load the XML file
 tree = ET.parse(file_path)
 root = tree.getroot()
 
@@ -26,8 +31,6 @@ def extract_reading_type_info(root):
 
 
 reading_type_info = extract_reading_type_info(root)
-
-print(reading_type_info)
 
 
 # Re-extract the usage data due to execution state reset
@@ -54,16 +57,21 @@ usage_data = extract_usage_data(root)
 df_usage = pd.DataFrame(usage_data)
 
 
-# Apply the powerOfTenMultiplier to adjust the usage values
+# Apply the powerOfTenMultiplier to adjust the usage values to Wh
 df_usage["value_wh"] = df_usage["value"] * 10 ** int(
     reading_type_info["powerOfTenMultiplier"]
 )
 df_usage["adjusted_value_kWh"] = df_usage["value_wh"] / 1000
 
+df_usage["year"] = df_usage["start_time"].dt.year
 df_usage["hour_of_day"] = df_usage["start_time"].dt.hour
 df_usage["day_of_week"] = df_usage["start_time"].dt.weekday
 df_usage["date"] = df_usage["start_time"].dt.date
 df_usage["is_weekend"] = df_usage["day_of_week"] >= 5
+
+on_holidays = holidays.Canada(years=df_usage["year"].unique(), prov="ON")
+
+df_usage["is_holiday"] = df_usage["date"].apply(lambda x: x in on_holidays)
 
 
 # Function to get the correct threshold based on the month
@@ -156,10 +164,9 @@ monthly_costs = {}
 
 def sum_cost(month, prefix):
     # TOU Calculation
-    monthly_data[f"{prefix}_cost"] = (
+    return (
         monthly_data["adjusted_value_kWh"] * monthly_data[f"{prefix}_rate_cents"] / 100
-    )
-    return monthly_data[f"{prefix}_cost"].sum()
+    ).sum()
 
 
 # Calculate the costs for each month
@@ -212,3 +219,47 @@ df_monthly_costs = pd.DataFrame.from_dict(monthly_costs, orient="index")
 
 # Display the monthly costs and differences
 print(df_monthly_costs)
+
+import calendar
+
+# Assuming df_monthly_costs's index is a list of month numbers
+df_monthly_costs.index = df_monthly_costs.index.map(lambda x: calendar.month_name[x])
+
+# Assuming df_monthly_costs is a DataFrame with 'TOU Cost', 'OLU Cost', and 'Tiered Cost' as columns
+months = df_monthly_costs.index
+bar_width = 0.3
+r1 = np.arange(len(months))
+r2 = [x + bar_width for x in r1]
+r3 = [x + bar_width for x in r2]
+
+plt.bar(
+    r1,
+    df_monthly_costs["TOU Cost"],
+    color="b",
+    width=bar_width,
+    edgecolor="grey",
+    label="TOU Cost",
+)
+plt.bar(
+    r2,
+    df_monthly_costs["OLU Cost"],
+    color="r",
+    width=bar_width,
+    edgecolor="grey",
+    label="OLU Cost",
+)
+plt.bar(
+    r3,
+    df_monthly_costs["Tiered Cost"],
+    color="g",
+    width=bar_width,
+    edgecolor="grey",
+    label="Tiered Cost",
+)
+
+plt.xlabel("Month", fontweight="bold")
+plt.xticks([r + bar_width for r in range(len(months))], months)
+plt.ylabel("Cost")
+plt.legend()
+
+plt.show()
